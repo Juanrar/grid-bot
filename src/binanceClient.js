@@ -3,7 +3,7 @@ import crypto from "cripto"
 
 const BASE_URL = "https://api.binance.com"
 
-export class BinanceCLient{
+export class BinanceClient{
     constructor(apiKey, secretKey){
         this.apiKey = apiKey
         this.secretKey = secretKey

@@ -1,11 +1,12 @@
 {
-  "name": "grid-bot",
-  "version": "1.0.0",
-  "description": "Bot de trading con la estrategia GRID, usado para aprender JS",
-  "main": "testConnection.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "author": "",
-  "license": "ISC"
+"name": "grid-bot",
+"version": "1.0.0",
+"type": "module",
+"description": "Bot de trading con la estrategia GRID, usado para aprender JS",
+"main": "testConnection.js",
+"scripts": {
+"test": "echo \"Error: no test specified\" && exit 1"
+},
+"author": "",
+"license": "ISC"
 }
