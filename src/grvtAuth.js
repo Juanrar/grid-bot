@@ -35,15 +35,17 @@ export class GrvtAuth {
             body: JSON.stringify({ api_key: this.apiKey }),
         })
 
+        const rawBody = await res.text()
         if (!res.ok) {
-            const text = await res.text()
-            throw new Error(`Login GRVT falló (${res.status}): ${text}`)
+            throw new Error(`Login GRVT falló (${res.status}): ${rawBody}`)
         }
 
         const setCookie = res.headers.get("set-cookie")
         const accountId = res.headers.get("x-grvt-account-id")
         if (!setCookie || !accountId) {
-            throw new Error("Login GRVT: faltan headers set-cookie / x-grvt-account-id")
+            throw new Error(
+                `Login GRVT: faltan headers set-cookie / x-grvt-account-id. Respuesta: ${rawBody}`
+            )
         }
 
         const match = setCookie.match(/gravity=([^;]+)/)

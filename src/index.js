@@ -55,8 +55,20 @@ async function main() {
     await client.login()
 
     // Apalancamiento del instrumento.
-    await client.setLeverage(config.pair, config.leverage)
-    console.log(`⚡ Leverage ${config.leverage}x configurado para ${config.pair}`)
+    // Algunas cuentas/entornos GRVT no exponen set_leverage en API; no abortamos el bot.
+    try {
+        await client.setLeverage(config.pair, config.leverage)
+        console.log(`⚡ Leverage ${config.leverage}x configurado para ${config.pair}`)
+    } catch (err) {
+        const msg = String(err?.message ?? "")
+        if (msg.includes("/set_leverage") && msg.includes("HTTP 404")) {
+            console.warn(
+                `⚠️  GRVT no expone set_leverage para esta cuenta/API. Continúo sin cambiar leverage por API; configúralo manualmente en la plataforma.`
+            )
+        } else {
+            throw err
+        }
+    }
 
     const engine = new GridEngine(client, config)
 

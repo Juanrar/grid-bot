@@ -12,7 +12,6 @@
 import { getInstrumentSpec } from "./grvtClient.js"
 
 const ORDER_ALLOC = 0.75 // margen de seguridad sobre el capital apalancado
-const QTY_FLOOR = 0.03
 const REPLACE_LAG_MS = 10000 // no re-colocar un nivel puesto hace < 10s (lag de GRVT)
 
 export class GridEngine {
@@ -42,13 +41,18 @@ export class GridEngine {
         const spacing = (upperPrice - lowerPrice) / numGrids
         const midPrice = (lowerPrice + upperPrice) / 2
         const effCap = investmentUSDT * leverage * ORDER_ALLOC
+        const qtyStep = this.spec.minSize
+        const qtyDecimals = this._stepDecimals(qtyStep)
 
-        let qty = Math.max(Math.ceil((effCap / numGrids / midPrice) * 100) / 100, QTY_FLOOR)
+        let qty = Math.max(
+            Math.ceil((effCap / numGrids / midPrice) / qtyStep) * qtyStep,
+            qtyStep
+        )
         // Garantizar min_notional en el precio más bajo (peor caso para buys).
         while (qty * lowerPrice < this.spec.minNotional) {
-            qty += this.spec.minSize
+            qty += qtyStep
         }
-        qty = Math.round(qty * 100) / 100
+        qty = Number(qty.toFixed(qtyDecimals))
         this.quantityPerLevel = qty
 
         const levels = []
@@ -71,6 +75,12 @@ export class GridEngine {
         return levels
     }
 
+    _stepDecimals(step) {
+        const s = String(step)
+        if (!s.includes(".")) return 0
+        return s.split(".")[1].length
+    }
+
     getFixedQty() {
         return this.quantityPerLevel
     }
@@ -83,8 +93,19 @@ export class GridEngine {
 
         console.log(`📊 Precio actual ${this.pair}: $${currentPrice}`)
 
+        let initialInventoryReady = true
         if (this.config.direction === "long") {
-            await this.executeInitialPurchase(currentPrice)
+            try {
+                await this.executeInitialPurchase(currentPrice)
+            } catch (err) {
+                const msg = String(err?.message ?? "")
+                if (msg.includes("Insufficient margin to create order") || msg.includes('"code":2080')) {
+                    initialInventoryReady = false
+                    console.warn("⚠️  Sin margen para compra inicial. Arranco solo con BUYs por debajo del precio.")
+                } else {
+                    throw err
+                }
+            }
         }
 
         // Nivel "gap": el más cercano al precio actual se deja sin orden.
@@ -98,6 +119,7 @@ export class GridEngine {
         for (const level of this.levels) {
             if (level.isFilled) continue
             if (!this._shouldPlaceOrder(level, currentPrice)) continue
+            if (this.config.direction === "long" && !initialInventoryReady && level.side === "sell") continue
             try {
                 await this._placeGridOrder(level)
                 placed++
