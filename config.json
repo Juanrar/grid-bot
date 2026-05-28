@@ -1,0 +1,10 @@
+{
+  "pair": "ETH_USDT_Perp",
+  "direction": "long",
+  "leverage": 10,
+  "lowerPrice": 1900,
+  "upperPrice": 2300,
+  "numGrids": 15,
+  "investmentUSDT": 50,
+  "monitorIntervalMs": 5000
+}
