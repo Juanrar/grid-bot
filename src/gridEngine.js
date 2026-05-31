@@ -93,17 +93,48 @@ export class GridEngine {
 
         console.log(`📊 Precio actual ${this.pair}: $${currentPrice}`)
 
+        // Idempotencia ante reinicios (clave para auto-arranque al prender la PC):
+        // consultamos el estado real en GRVT antes de comprar o colocar nada,
+        // para no duplicar posición en cada encendido.
+        const [openOrders, position] = await Promise.all([
+            this.client.getOpenOrders(this.pair),
+            this.client.getPosition(this.pair),
+        ])
+        const positionSize = position
+            ? Math.abs(parseFloat(position.size ?? position.balance ?? "0")) || 0
+            : 0
+
+        // Caso 1: ya hay órdenes vivas → el grid está en marcha (la PC se
+        // reinició con órdenes resting). No tocamos nada; el monitor loop
+        // reconcilia los niveles y repone lo que falte.
+        if (openOrders.length > 0) {
+            console.log(
+                `♻️  ${openOrders.length} órdenes abiertas detectadas (posición ${positionSize} ${this.pair}). ` +
+                    `Grid ya en marcha; omito bootstrap y dejo que el monitor reconcilie.`
+            )
+            return
+        }
+
         let initialInventoryReady = true
         if (this.config.direction === "long") {
-            try {
-                await this.executeInitialPurchase(currentPrice)
-            } catch (err) {
-                const msg = String(err?.message ?? "")
-                if (msg.includes("Insufficient margin to create order") || msg.includes('"code":2080')) {
-                    initialInventoryReady = false
-                    console.warn("⚠️  Sin margen para compra inicial. Arranco solo con BUYs por debajo del precio.")
-                } else {
-                    throw err
+            if (positionSize > 0) {
+                // Caso 2: hay inventario de un arranque anterior pero sin órdenes
+                // (se cancelaron al apagar). Colocamos el grid SIN recomprar.
+                console.log(
+                    `♻️  Posición existente de ${positionSize} ${this.pair}; omito compra inicial (idempotencia).`
+                )
+            } else {
+                // Caso 3: arranque limpio sin posición → compra inicial normal.
+                try {
+                    await this.executeInitialPurchase(currentPrice)
+                } catch (err) {
+                    const msg = String(err?.message ?? "")
+                    if (msg.includes("Insufficient margin to create order") || msg.includes('"code":2080')) {
+                        initialInventoryReady = false
+                        console.warn("⚠️  Sin margen para compra inicial. Arranco solo con BUYs por debajo del precio.")
+                    } else {
+                        throw err
+                    }
                 }
             }
         }
