@@ -1,0 +1,1422 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.env.example
+.gitignore
+borrar-tarea.ps1
+config.json
+crear-tarea.ps1
+ecosystem.config.cjs
+package.json
+README.md
+src/gridEngine.js
+src/grvtAuth.js
+src/grvtClient.js
+src/index.js
+src/orderSigner.js
+start-bot-hidden.vbs
+start-bot.bat
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".env.example">
+# Credenciales GRVT — obtenlas en https://grvt.io (Settings > API)
+# El API SECRET es tu private key de firma EIP-712. Trátala como una llave de wallet.
+GRVT_API_KEY=
+GRVT_API_SECRET=0x...
+GRVT_TRADING_ACCOUNT_ID=
+GRVT_TRADING_ADDRESS=0x...
+</file>
+
+<file path="borrar-tarea.ps1">
+# Elimina la Tarea Programada "GridBot" (desactiva el auto-arranque).
+# EJECUTAR COMO ADMINISTRADOR.
+#   powershell -ExecutionPolicy Bypass -File borrar-tarea.ps1
+
+Unregister-ScheduledTask -TaskName "GridBot" -Confirm:$false
+Write-Host "Tarea 'GridBot' eliminada. El bot ya no arranca solo al iniciar sesion." -ForegroundColor Yellow
+</file>
+
+<file path="crear-tarea.ps1">
+# Registra la Tarea Programada "GridBot" para arrancar el bot al iniciar sesion.
+# EJECUTAR COMO ADMINISTRADOR (una sola vez).
+#   Click derecho sobre este archivo > "Ejecutar con PowerShell" (como admin),
+#   o desde una terminal elevada:  powershell -ExecutionPolicy Bypass -File crear-tarea.ps1
+
+# Lanzamos via wscript + .vbs para que NO se vea ninguna ventana de consola.
+$action  = New-ScheduledTaskAction -Execute "wscript.exe" `
+    -Argument '"C:\Users\juanc\OneDrive\Escritorio\projects\grid-bot\start-bot-hidden.vbs"'
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+$trigger.Delay = "PT1M"   # espera 1 min tras el login (red/OneDrive listos)
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -StartWhenAvailable
+
+Register-ScheduledTask `
+    -TaskName "GridBot" `
+    -Action $action `
+    -Trigger $trigger `
+    -Settings $settings `
+    -RunLevel Limited `
+    -Description "Arranca el grid-bot de GRVT al iniciar sesion en Windows" `
+    -Force
+
+Write-Host ""
+Write-Host "Tarea 'GridBot' registrada. Arranca 1 min despues de iniciar sesion." -ForegroundColor Green
+Write-Host "Logs en: C:\Users\juanc\OneDrive\Escritorio\projects\grid-bot\logs\bot.log"
+Get-ScheduledTask -TaskName "GridBot" | Select-Object TaskName, State
+</file>
+
+<file path="ecosystem.config.cjs">
+// Configuración de pm2 para correr el grid bot 24/7 en la VM de Oracle Cloud.
+// Uso: pm2 start ecosystem.config.cjs && pm2 save
+//
+// pm2 reinicia el proceso si crashea. OJO: hoy cada reinicio vuelve a llamar
+// placeInitialOrders() (compra market inicial), lo que puede duplicar posición.
+// Hasta que placeInitialOrders sea idempotente, conviene investigar cada
+// reinicio en los logs (pm2 logs grid-bot) antes de dejarlo totalmente solo.
+
+module.exports = {
+  apps: [
+    {
+      name: "grid-bot",
+      script: "src/index.js",
+      // Reinicia si el proceso muere, con backoff para no spamear el exchange.
+      autorestart: true,
+      restart_delay: 5000,         // espera 5s antes de relanzar
+      max_restarts: 10,            // si crashea 10 veces seguidas, se rinde
+      min_uptime: "60s",           // debe vivir 60s para contar como "arranque ok"
+      // Reinicia si supera 300MB de RAM (fuga de memoria, etc.).
+      max_memory_restart: "300M",
+      // Logs con timestamp.
+      time: true,
+      out_file: "logs/out.log",
+      error_file: "logs/error.log",
+      // Las credenciales se leen de .env vía dotenv (no se ponen acá).
+      env: {
+        NODE_ENV: "production",
+      },
+    },
+  ],
+}
+</file>
+
+<file path="src/grvtClient.js">
+// Cliente GRVT simplificado: market data (público) + trading (autenticado).
+// Solo cubre lo necesario para operar un grid de ETH_USDT_Perp.
+
+import { GrvtAuth } from "./grvtAuth.js"
+import { buildSignedOrder } from "./orderSigner.js"
+
+const MARKET_DATA_URL = "https://market-data.grvt.io/full/v1"
+const TRADING_URL = "https://trades.grvt.io/full/v1"
+
+// Specs de instrumentos. Suficiente para firmar y validar órdenes sin
+// llamar al endpoint dinámico /instruments.
+export const INSTRUMENT_SPECS = {
+    ETH_USDT_Perp: {
+        instrument: "ETH_USDT_Perp",
+        assetId: "0x030401",
+        baseDecimals: 9,
+        minSize: 0.001,
+        minNotional: 20,
+        tickSize: 0.01,
+    },
+    BTC_USDT_Perp: {
+        instrument: "BTC_USDT_Perp",
+        assetId: "0x030501",
+        baseDecimals: 9,
+        minSize: 0.001,
+        minNotional: 100,
+        tickSize: 0.1,
+    },
+}
+
+export function getInstrumentSpec(pair) {
+    const spec = INSTRUMENT_SPECS[pair]
+    if (!spec) throw new Error(`Instrumento no soportado: ${pair}`)
+    return spec
+}
+
+// Limita a ~10 requests/segundo (límite de GRVT).
+class RateLimiter {
+    constructor(maxRequests = 10, windowMs = 1000) {
+        this.maxRequests = maxRequests
+        this.windowMs = windowMs
+        this.timestamps = []
+    }
+
+    async wait() {
+        const now = Date.now()
+        this.timestamps = this.timestamps.filter((t) => now - t < this.windowMs)
+        if (this.timestamps.length >= this.maxRequests) {
+            const oldest = this.timestamps[0]
+            const waitMs = this.windowMs - (now - oldest) + 50
+            if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs))
+        }
+        this.timestamps.push(Date.now())
+    }
+}
+
+export class GrvtClient {
+    constructor({ apiKey, apiSecret, tradingAddress, accountId }) {
+        this.auth = new GrvtAuth(apiKey)
+        this.signingCreds = {
+            privateKey: apiSecret,
+            signerAddress: tradingAddress,
+            subAccountId: accountId,
+        }
+        this.subAccountId = accountId
+        this.rateLimiter = new RateLimiter()
+    }
+
+    async login() {
+        return this.auth.login()
+    }
+
+    // ── Helpers de request ──────────────────────────────────────────
+
+    async _publicRequest(url, body = {}, timeout = 15000) {
+        const res = await fetch(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": "grid-bot/1.0",
+            },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(timeout),
+        })
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status} en ${url}: ${await res.text()}`)
+        }
+        const data = await res.json()
+        return data.result ?? data
+    }
+
+    async _authedRequest(url, body = {}, timeout = 30000) {
+        await this.rateLimiter.wait()
+        await this.auth.ensureAuth()
+
+        const doFetch = () =>
+            fetch(url, {
+                method: "POST",
+                headers: this.auth.authHeaders(),
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(timeout),
+            })
+
+        let res = await doFetch()
+
+        // Sesión expirada: re-autenticar una vez y reintentar.
+        if (res.status === 401) {
+            this.auth.invalidate()
+            await this.auth.ensureAuth()
+            res = await doFetch()
+        }
+
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status} en ${url}: ${await res.text()}`)
+        }
+        const data = await res.json()
+        return data.result ?? data
+    }
+
+    // ── Market data (público) ───────────────────────────────────────
+
+    async getTicker(instrument) {
+        return this._publicRequest(`${MARKET_DATA_URL}/ticker`, { instrument })
+    }
+
+    async getPrice(instrument) {
+        const ticker = await this.getTicker(instrument)
+        return parseFloat(ticker.last_price)
+    }
+
+    // ── Trading (autenticado) ───────────────────────────────────────
+
+    async getPositions() {
+        const data = await this._authedRequest(`${TRADING_URL}/positions`, {
+            sub_account_id: this.subAccountId,
+        })
+        return Array.isArray(data) ? data : []
+    }
+
+    async getPosition(instrument) {
+        const positions = await this.getPositions()
+        return positions.find((p) => p.instrument === instrument) ?? null
+    }
+
+    async getOpenOrders(instrument) {
+        const body = { sub_account_id: this.subAccountId }
+        if (instrument) body.instrument = instrument
+        const data = await this._authedRequest(`${TRADING_URL}/open_orders`, body)
+        const all = Array.isArray(data) ? data : []
+        if (!instrument) return all
+        // GRVT a veces ignora el filtro de instrumento; filtramos client-side.
+        return all.filter((o) => {
+            if (o.instrument === instrument) return true
+            return o.legs?.[0]?.instrument === instrument
+        })
+    }
+
+    async getFillHistory(limit = 100, instrument) {
+        const body = {
+            sub_account_id: this.subAccountId,
+            limit: Math.min(limit, 1000),
+        }
+        if (instrument) body.instrument = instrument
+        const data = await this._authedRequest(`${TRADING_URL}/fill_history`, body)
+        return Array.isArray(data) ? data : []
+    }
+
+    async setLeverage(instrument, leverage) {
+        await this._authedRequest(`${TRADING_URL}/set_leverage`, {
+            sub_account_id: this.subAccountId,
+            instrument,
+            leverage: String(leverage),
+        })
+        return true
+    }
+
+    // Valida tamaño/notional/tick antes de firmar.
+    _validateOrder(spec, size, price) {
+        const sizeNum = parseFloat(size)
+        const priceNum = parseFloat(price)
+        if (sizeNum < spec.minSize) {
+            throw new Error(`Size ${size} < min_size ${spec.minSize} para ${spec.instrument}`)
+        }
+        const notional = sizeNum * priceNum
+        if (notional < spec.minNotional) {
+            throw new Error(`Notional $${notional.toFixed(2)} < min_notional $${spec.minNotional}`)
+        }
+    }
+
+    /**
+     * Crea una orden firmada con EIP-712.
+     * @param {object} req - { instrument, side, size, price, type, timeInForce?, postOnly? }
+     * @param {boolean} allowMarket - permite IOC/market (compra inicial / cierre)
+     */
+    async createOrder(req, allowMarket = false) {
+        await this.rateLimiter.wait()
+        const spec = getInstrumentSpec(req.instrument)
+        const isMarket = req.type === "market"
+
+        if (isMarket && !allowMarket) {
+            throw new Error("Solo se permiten órdenes limit (usar allowMarket=true para casos especiales)")
+        }
+        if (!isMarket) this._validateOrder(spec, req.size, req.price)
+
+        // time_in_force: gtc=1, ioc=3
+        const tifMap = { gtc: 1, ioc: 3 }
+        const timeInForce = tifMap[req.timeInForce ?? "gtc"] ?? 1
+
+        const payload = buildSignedOrder(
+            {
+                side: req.side,
+                size: req.size,
+                price: req.price,
+                isMarket,
+                timeInForce,
+                postOnly: req.postOnly ?? false,
+            },
+            this.signingCreds,
+            spec
+        )
+
+        const data = await this._authedRequest(`${TRADING_URL}/create_order`, payload)
+        const orderId = data.order_id ?? data.result?.order_id
+
+        return {
+            order_id: orderId,
+            instrument: req.instrument,
+            side: req.side,
+            size: req.size,
+            price: req.price ?? "0",
+            status: "open",
+        }
+    }
+
+    async cancelOrder(orderId, instrument) {
+        try {
+            await this._authedRequest(`${TRADING_URL}/cancel_order`, {
+                sub_account_id: this.subAccountId,
+                order_id: orderId,
+                instrument,
+            })
+            return true
+        } catch (err) {
+            console.error(`Error cancelando orden ${orderId}: ${err.message}`)
+            return false
+        }
+    }
+
+    async cancelAllOrders(instrument) {
+        const body = { sub_account_id: this.subAccountId }
+        if (instrument) body.instrument = instrument
+        try {
+            const data = await this._authedRequest(`${TRADING_URL}/cancel_all_orders`, body)
+            return data.cancelled_count ?? 0
+        } catch (err) {
+            console.error(`Error cancelando todas las órdenes: ${err.message}`)
+            return 0
+        }
+    }
+}
+</file>
+
+<file path="src/orderSigner.js">
+// Firma de órdenes GRVT con EIP-712 (V4).
+// Portado de la implementación verificada del repo original.
+// CRÍTICO: PRICE_MULTIPLIER = 1e9 (no usar quote_decimals).
+
+import { SignTypedDataVersion, signTypedData } from "@metamask/eth-sig-util"
+
+const EIP712_DOMAIN = {
+    name: "GRVT Exchange",
+    version: "0",
+    chainId: 325, // GRVT producción
+}
+
+const EIP712_TYPES = {
+    EIP712Domain: [
+        { name: "name", type: "string" },
+        { name: "version", type: "string" },
+        { name: "chainId", type: "uint256" },
+    ],
+    Order: [
+        { name: "subAccountID", type: "uint64" },
+        { name: "isMarket", type: "bool" },
+        { name: "timeInForce", type: "uint8" },
+        { name: "postOnly", type: "bool" },
+        { name: "reduceOnly", type: "bool" },
+        { name: "legs", type: "OrderLeg[]" },
+        { name: "nonce", type: "uint32" },
+        { name: "expiration", type: "int64" },
+    ],
+    OrderLeg: [
+        { name: "assetID", type: "uint256" },
+        { name: "contractSize", type: "uint64" },
+        { name: "limitPrice", type: "uint64" },
+        { name: "isBuyingContract", type: "bool" },
+    ],
+}
+
+const PRICE_MULTIPLIER = 1e9
+
+// time_in_force numérico → string del API.
+const TIF_NUM_TO_STRING = {
+    1: "GOOD_TILL_TIME", // GTC
+    3: "IMMEDIATE_OR_CANCEL", // IOC
+}
+
+function generateNonce() {
+    return Math.floor(Math.random() * 1e9)
+}
+
+// Expiración en nanosegundos (default 24h).
+function generateExpiration(hours = 24) {
+    const ms = Date.now() + hours * 3600000
+    return (ms * 1e6).toString()
+}
+
+function roundToTickSize(price, tickSize) {
+    return Math.floor(price / tickSize) * tickSize
+}
+
+// price (string) → limitPrice entero usando PRICE_MULTIPLIER.
+function priceToLimitPrice(price, tickSize) {
+    const p = roundToTickSize(parseFloat(price), tickSize)
+    return Math.round(p * PRICE_MULTIPLIER).toString()
+}
+
+// size (string) → contractSize en base units (base_decimals).
+function sizeToContractSize(size, spec) {
+    const sized = Math.floor(parseFloat(size) / spec.minSize) * spec.minSize
+    const contractSize = Math.round(sized * Math.pow(10, spec.baseDecimals))
+    return contractSize.toString()
+}
+
+// Redondea un precio al tick size para enviarlo al API (string human-readable).
+export function roundPrice(price, tickSize) {
+    const p = typeof price === "string" ? parseFloat(price) : price
+    return roundToTickSize(p, tickSize).toString()
+}
+
+/**
+ * Firma una orden y devuelve el payload listo para POST /create_order.
+ *
+ * @param {object} params - { side: 'buy'|'sell', size, price, isMarket?, timeInForce?, postOnly? }
+ * @param {object} creds  - { privateKey, signerAddress, subAccountId }
+ * @param {object} spec   - { instrument, assetId, baseDecimals, minSize, tickSize }
+ */
+export function buildSignedOrder(params, creds, spec) {
+    const {
+        side,
+        size,
+        price,
+        isMarket = false,
+        timeInForce = 1,
+        postOnly = false,
+    } = params
+
+    if (!isMarket && price == null) {
+        throw new Error("Precio requerido para órdenes limit")
+    }
+    if (!creds.privateKey || !creds.signerAddress || !creds.subAccountId) {
+        throw new Error("Credenciales de firma incompletas (privateKey / signerAddress / subAccountId)")
+    }
+
+    const nonce = generateNonce()
+    const expiration = generateExpiration(24)
+    const contractSize = sizeToContractSize(size, spec)
+    const limitPrice = isMarket ? "0" : priceToLimitPrice(price, spec.tickSize)
+    const isBuyingContract = side === "buy"
+
+    const orderMessage = {
+        subAccountID: creds.subAccountId,
+        isMarket,
+        timeInForce,
+        postOnly,
+        reduceOnly: false,
+        legs: [
+            {
+                assetID: spec.assetId,
+                contractSize,
+                limitPrice,
+                isBuyingContract,
+            },
+        ],
+        nonce,
+        expiration,
+    }
+
+    const typedData = {
+        primaryType: "Order",
+        domain: EIP712_DOMAIN,
+        types: EIP712_TYPES,
+        message: orderMessage,
+    }
+
+    const signature = signTypedData({
+        privateKey: Buffer.from(creds.privateKey.replace(/^0x/, ""), "hex"),
+        data: typedData,
+        version: SignTypedDataVersion.V4,
+    })
+
+    const r = "0x" + signature.slice(2, 66)
+    const s = "0x" + signature.slice(66, 130)
+    const v = parseInt(signature.slice(130, 132), 16)
+
+    // Payload con valores human-readable que espera /create_order.
+    return {
+        order: {
+            sub_account_id: creds.subAccountId,
+            is_market: isMarket,
+            time_in_force: TIF_NUM_TO_STRING[timeInForce] ?? "GOOD_TILL_TIME",
+            post_only: postOnly,
+            reduce_only: false,
+            legs: [
+                {
+                    instrument: spec.instrument,
+                    size: roundPrice(size, spec.minSize),
+                    limit_price: isMarket ? undefined : roundPrice(price, spec.tickSize),
+                    is_buying_asset: isBuyingContract,
+                },
+            ],
+            signature: {
+                signer: creds.signerAddress,
+                r,
+                s,
+                v,
+                expiration,
+                nonce,
+            },
+            metadata: {
+                client_order_id: String(Date.now()),
+            },
+        },
+    }
+}
+</file>
+
+<file path="start-bot-hidden.vbs">
+' Lanza start-bot.bat con ventana OCULTA.
+' Lo invoca la Tarea Programada "GridBot".
+' El "0" = ventana oculta; False = no esperar a que termine.
+' Asegúrate de que la ruta a start-bot.bat sea correcta.
+Set sh = CreateObject("WScript.Shell")
+sh.Run "cmd /c ""C:\Users\juanc\OneDrive\Escritorio\projects\grid-bot\start-bot.bat""", 0, False
+</file>
+
+<file path="start-bot.bat">
+@echo off
+REM Wrapper para arrancar el grid-bot al iniciar sesion en Windows.
+REM Lo invoca la Tarea Programada "GridBot" (ver crear-tarea mas abajo).
+REM Hace cd a la carpeta del proyecto, asegura logs/ y vuelca todo a logs\bot.log.
+
+cd /d "C:\Users\juanc\OneDrive\Escritorio\projects\grid-bot"
+if not exist logs mkdir logs
+
+echo ============================================================ >> logs\bot.log
+echo Bot iniciado: %DATE% %TIME% >> logs\bot.log
+echo ============================================================ >> logs\bot.log
+
+"C:\Program Files\nodejs\node.exe" src\index.js >> logs\bot.log 2>&1
+
+echo Bot finalizado: %DATE% %TIME% (exit %ERRORLEVEL%) >> logs\bot.log
+</file>
+
+<file path="config.json">
+{
+  "pair": "ETH_USDT_Perp",
+  "direction": "long",
+  "leverage": 20,
+  "lowerPrice": 1900,
+  "upperPrice": 2200,
+  "numGrids": 90,
+  "investmentUSDT": 60,
+  "monitorIntervalMs": 5000
+}
+</file>
+
+<file path="README.md">
+# grid-bot
+
+Bot de **grid trading** para el exchange de perpetuos [GRVT](https://grvt.io).
+Coloca una rejilla de órdenes límite entre un precio mínimo y máximo y captura
+el spread cada vez que el precio oscila dentro del rango. Escrito en Node.js
+(ESM puro, sin build).
+
+## ¿Cómo funciona?
+
+La estrategia (en modo `long`) divide el rango `[lowerPrice, upperPrice]` en
+`numGrids` niveles equiespaciados:
+
+- Los niveles **por debajo** del precio actual son órdenes de **compra**.
+- Los niveles **por encima** son órdenes de **venta** (respaldadas por una
+  compra market inicial que arma el inventario).
+- El nivel más cercano al precio se deja vacío (el "gap" o punto de entrada).
+- Cuando un nivel se llena, el bot coloca automáticamente la **contra-orden** un
+  nivel más arriba/abajo, capturando la diferencia como ganancia.
+
+El estado de la rejilla vive **en memoria** y se reconcilia contra las órdenes
+reales de GRVT en cada tick del monitor, así que el bot se autocorrige si una
+orden se cancela o queda desincronizada.
+
+---
+
+## Instalación
+
+```bash
+git clone <tu-repo> grid-bot
+cd grid-bot
+npm install
+```
+
+---
+
+## Configuración
+
+### 1. Credenciales (`.env`)
+
+Copiá `.env.example` a `.env` y completá tus credenciales de GRVT:
+
+```bash
+GRVT_API_KEY=               # API key
+GRVT_API_SECRET=0x...       # private key de firma EIP-712 — ¡trátala como una llave de wallet!
+GRVT_TRADING_ACCOUNT_ID=    # sub-account id
+GRVT_TRADING_ADDRESS=0x...  # dirección del signer
+```
+
+### 2. Parámetros de la rejilla (`config.json`)
+
+```jsonc
+{
+  "pair": "ETH_USDT_Perp",   // instrumento (ver instrumentos soportados)
+  "direction": "long",       // estrategia
+  "leverage": 20,            // apalancamiento
+  "lowerPrice": 1900,        // límite inferior del rango
+  "upperPrice": 2200,        // límite superior del rango
+  "numGrids": 60,            // cantidad de niveles
+  "investmentUSDT": 60,      // capital a usar (en USDT)
+  "monitorIntervalMs": 5000  // frecuencia del loop de monitoreo (opcional)
+}
+```
+
+**Validaciones**: `lowerPrice` debe ser menor que `upperPrice`, `numGrids ≥ 1`,
+y el precio actual debe caer dentro del rango al arrancar. La cantidad por nivel
+se calcula a partir de `investmentUSDT * leverage` y se ajusta para cumplir el
+notional mínimo del instrumento.
+
+### 3. Cómo elegir el par
+
+Conviene operar pares donde el **costo mínimo por orden sea bajo**: cuanto más
+chica es la orden mínima, más grillas podés meter en el mismo capital y mejor
+aprovechás los movimientos del precio.
+
+| Par  | Tamaño mínimo | Notional aproximado |
+| ---- | ------------- | ------------------- |
+| BTC  | 0.002         | ~147 USDT           |
+| ETH  | 0.010         | ~20 USDT            |
+| SOL  | 0.07          | ~5 USDT             |
+
+La orden mínima (en USDT) es mucho menor en monedas con menor valor por unidad,
+así que con el mismo capital armás una rejilla más densa.
+
+> Actualmente solo están cableados `ETH_USDT_Perp` y `BTC_USDT_Perp` en
+> `INSTRUMENT_SPECS` (`src/grvtClient.js`). Para usar otro par (p. ej. SOL),
+> agregá ahí su spec: `assetId`, decimales, `tickSize`, `minSize` y `minNotional`.
+
+---
+
+## Uso
+
+```bash
+npm start
+```
+
+El bot hace login, configura el apalancamiento (si la API lo permite), coloca
+la rejilla inicial y arranca el loop de monitoreo. Para detenerlo, `Ctrl+C`:
+hace un **apagado limpio que cancela las órdenes abiertas, pero NO cierra la
+posición** (el inventario queda en tu cuenta).
+
+### Reinicios seguros
+
+`placeInitialOrders()` es **idempotente**: al arrancar inspecciona las órdenes y
+la posición reales antes de comprar o colocar nada.
+
+- Si ya hay órdenes vivas → no toca nada, el monitor reconcilia.
+- Si hay posición pero sin órdenes → coloca la rejilla **sin recomprar**.
+- Solo en un arranque limpio (sin posición ni órdenes) hace la compra inicial.
+
+Esto evita duplicar la posición cuando se reinicia la PC o el gestor de procesos.
+
+---
+
+### Windows (Tarea Programada)
+
+Para arrancar el bot al iniciar sesión, con ventana oculta:
+
+```powershell
+# Como administrador, una sola vez:
+powershell -ExecutionPolicy Bypass -File crear-tarea.ps1
+```
+
+Registra la tarea `GridBot` (arranca 1 min después del login). Para quitarla,
+ejecutá `borrar-tarea.ps1`. Los logs van a `logs\bot.log`.
+
+> Estos scripts usan la ruta absoluta del proyecto; actualizalos si movés la
+> carpeta.
+</file>
+
+<file path="src/grvtAuth.js">
+// Autenticación con GRVT.
+// Flujo: POST https://edge.grvt.io/auth/api_key/login con { api_key }
+// → respuesta trae Set-Cookie: gravity=XXX y header X-Grvt-Account-Id.
+// Esos dos valores se usan en todas las llamadas autenticadas de trading.
+
+import dns from "dns"
+
+// GRVT resuelve mal sobre IPv6 en algunas redes; forzamos IPv4.
+dns.setDefaultResultOrder("ipv4first")
+
+const LOGIN_URL = "https://edge.grvt.io/auth/api_key/login"
+const SESSION_TTL_MS = 23 * 60 * 60 * 1000 // 23h (margen de seguridad sobre 24h)
+const REAUTH_MARGIN_MS = 60 * 60 * 1000 // re-auth cuando queda menos de 1h
+
+export class GrvtAuth {
+    constructor(apiKey) {
+        if (!apiKey) throw new Error("GRVT_API_KEY no configurada en .env")
+        this.apiKey = apiKey
+        this.gravityCookie = ""
+        this.accountId = ""
+        this.expiresAt = 0
+    }
+
+    get isAuthenticated() {
+        return !!this.gravityCookie && Date.now() < this.expiresAt
+    }
+
+    async login() {
+        const res = await fetch(LOGIN_URL, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "User-Agent": "grid-bot/1.0",
+            },
+            body: JSON.stringify({ api_key: this.apiKey }),
+        })
+
+        const rawBody = await res.text()
+        if (!res.ok) {
+            throw new Error(`Login GRVT falló (${res.status}): ${rawBody}`)
+        }
+
+        const setCookie = res.headers.get("set-cookie")
+        const accountId = res.headers.get("x-grvt-account-id")
+        if (!setCookie || !accountId) {
+            throw new Error(
+                `Login GRVT: faltan headers set-cookie / x-grvt-account-id. Respuesta: ${rawBody}`
+            )
+        }
+
+        const match = setCookie.match(/gravity=([^;]+)/)
+        if (!match) throw new Error("Login GRVT: cookie 'gravity' no encontrada")
+
+        this.gravityCookie = match[1]
+        this.accountId = accountId
+        this.expiresAt = Date.now() + SESSION_TTL_MS
+
+        const hours = Math.floor(SESSION_TTL_MS / 1000 / 3600)
+        console.log(`🔐 Autenticado con GRVT (account ${accountId}, sesión ~${hours}h)`)
+        return true
+    }
+
+    // Garantiza una sesión válida antes de cada request de trading.
+    async ensureAuth() {
+        if (!this.gravityCookie || Date.now() > this.expiresAt - REAUTH_MARGIN_MS) {
+            await this.login()
+        }
+    }
+
+    // Headers para las llamadas autenticadas.
+    authHeaders() {
+        return {
+            "Content-Type": "application/json",
+            "Cookie": `gravity=${this.gravityCookie}`,
+            "X-Grvt-Account-Id": this.accountId,
+            "User-Agent": "grid-bot/1.0",
+        }
+    }
+
+    // Invalida la sesión (forzar re-login en el próximo request).
+    invalidate() {
+        this.gravityCookie = ""
+        this.expiresAt = 0
+    }
+}
+</file>
+
+<file path="src/index.js">
+// Entry point del grid bot.
+// Carga credenciales de .env + parámetros de config.json, conecta a GRVT,
+// crea el grid de ETH_USDT y lo opera en vivo.
+
+import "dotenv/config"
+import { readFileSync } from "fs"
+import { fileURLToPath } from "url"
+import { dirname, join } from "path"
+import { GrvtClient } from "./grvtClient.js"
+import { GridEngine } from "./gridEngine.js"
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+
+function loadConfig() {
+    const path = join(__dirname, "..", "config.json")
+    const config = JSON.parse(readFileSync(path, "utf8"))
+
+    const required = ["pair", "direction", "leverage", "lowerPrice", "upperPrice", "numGrids", "investmentUSDT"]
+    for (const key of required) {
+        if (config[key] == null) throw new Error(`config.json: falta el campo '${key}'`)
+    }
+    if (config.lowerPrice >= config.upperPrice) {
+        throw new Error("config.json: lowerPrice debe ser < upperPrice")
+    }
+    if (config.numGrids < 1) throw new Error("config.json: numGrids debe ser >= 1")
+    return config
+}
+
+function loadCredentials() {
+    const creds = {
+        apiKey: process.env.GRVT_API_KEY,
+        apiSecret: process.env.GRVT_API_SECRET,
+        tradingAddress: process.env.GRVT_TRADING_ADDRESS,
+        accountId: process.env.GRVT_TRADING_ACCOUNT_ID,
+    }
+    const missing = Object.entries(creds)
+        .filter(([, v]) => !v)
+        .map(([k]) => k)
+    if (missing.length > 0) {
+        throw new Error(`Faltan credenciales en .env: ${missing.join(", ")}`)
+    }
+    return creds
+}
+
+async function main() {
+    const config = loadConfig()
+    const creds = loadCredentials()
+
+    console.log("═".repeat(60))
+    console.log(`🤖 Grid Bot — ${config.pair} ${config.direction.toUpperCase()} ${config.leverage}x`)
+    console.log(`   Rango: $${config.lowerPrice} - $${config.upperPrice} | ${config.numGrids} grids | $${config.investmentUSDT} USDT`)
+    console.log("═".repeat(60))
+
+    const client = new GrvtClient(creds)
+    await client.login()
+
+    // Apalancamiento del instrumento.
+    // Algunas cuentas/entornos GRVT no exponen set_leverage en API; no abortamos el bot.
+    try {
+        await client.setLeverage(config.pair, config.leverage)
+        console.log(`⚡ Leverage ${config.leverage}x configurado para ${config.pair}`)
+    } catch (err) {
+        const msg = String(err?.message ?? "")
+        if (msg.includes("/set_leverage") && msg.includes("HTTP 404")) {
+            console.warn(
+                `⚠️  GRVT no expone set_leverage para esta cuenta/API. Continúo sin cambiar leverage por API; configúralo manualmente en la plataforma.`
+            )
+        } else {
+            throw err
+        }
+    }
+
+    const engine = new GridEngine(client, config)
+
+    // Coloca el grid inicial (incluye compra inicial market en LONG).
+    await engine.placeInitialOrders()
+
+    // Arranca el loop de monitoreo/reposición.
+    engine.start(config.monitorIntervalMs ?? 5000)
+
+    // Apagado limpio: cancela órdenes abiertas (no cierra posición).
+    const shutdown = async () => {
+        console.log("\n⏹️  Señal de apagado recibida...")
+        await engine.stop()
+        process.exit(0)
+    }
+    process.on("SIGINT", shutdown)
+    process.on("SIGTERM", shutdown)
+}
+
+main().catch((err) => {
+    console.error(`💥 Error fatal: ${err.message}`)
+    process.exit(1)
+})
+</file>
+
+<file path=".gitignore">
+.env
+node_modules
+/logs
+</file>
+
+<file path="src/gridEngine.js">
+// Motor de grid trading simplificado.
+// Estado en memoria, reconstruido desde config.json y reconciliado contra
+// las órdenes abiertas reales de GRVT en cada arranque/tick.
+//
+// Estrategia (LONG):
+//   - Se generan numGrids+1 niveles equiespaciados entre lowerPrice y upperPrice.
+//   - Compra inicial market para respaldar los niveles SELL por encima del precio.
+//   - Se deja vacío el nivel más cercano al precio (el "gap" / punto de entrada).
+//   - Loop: cuando un nivel se llena, se coloca una contra-orden un nivel
+//     arriba/abajo capturando el spread como profit.
+
+import { getInstrumentSpec } from "./grvtClient.js"
+
+const ORDER_ALLOC = 0.75 // margen de seguridad sobre el capital apalancado
+const REPLACE_LAG_MS = 10000 // no re-colocar un nivel puesto hace < 10s (lag de GRVT)
+
+export class GridEngine {
+    constructor(client, config) {
+        this.client = client
+        this.config = config
+        this.pair = config.pair
+        this.spec = getInstrumentSpec(config.pair)
+        this.levels = [] // { index, price, side, quantity, isFilled, orderId }
+        this.quantityPerLevel = 0
+        this.recentlyPlaced = new Map() // index → timestamp
+        this.processedFills = new Set() // fill_id procesados
+        this.running = false
+    }
+
+    // ── Cálculo de niveles ───────────────────────────────────────────
+
+    calculateGridLevels(currentPrice) {
+        const { lowerPrice, upperPrice, numGrids, investmentUSDT, leverage, direction } = this.config
+
+        if (currentPrice <= lowerPrice || currentPrice >= upperPrice) {
+            throw new Error(
+                `Precio actual ${currentPrice} fuera del rango [${lowerPrice}, ${upperPrice}]`
+            )
+        }
+
+        const spacing = (upperPrice - lowerPrice) / numGrids
+        const midPrice = (lowerPrice + upperPrice) / 2
+        const effCap = investmentUSDT * leverage * ORDER_ALLOC
+        const qtyStep = this.spec.minSize
+        const qtyDecimals = this._stepDecimals(qtyStep)
+
+        let qty = Math.max(
+            Math.ceil((effCap / numGrids / midPrice) / qtyStep) * qtyStep,
+            qtyStep
+        )
+        // Garantizar min_notional en el precio más bajo (peor caso para buys).
+        while (qty * lowerPrice < this.spec.minNotional) {
+            qty += qtyStep
+        }
+        qty = Number(qty.toFixed(qtyDecimals))
+        this.quantityPerLevel = qty
+
+        const levels = []
+        for (let i = 0; i <= numGrids; i++) {
+            const price = Math.round((lowerPrice + i * spacing) * 100) / 100
+            let side
+            if (direction === "long") {
+                side = price < currentPrice ? "buy" : "sell"
+            } else {
+                side = price > currentPrice ? "sell" : "buy"
+            }
+            levels.push({ index: i, price, side, quantity: qty, isFilled: false, orderId: null })
+        }
+
+        this.levels = levels
+        console.log(
+            `🧮 Grid: ${numGrids} grids (${levels.length} niveles), spacing $${spacing.toFixed(2)}, ` +
+                `qty ${qty} por nivel (effCap $${effCap.toFixed(2)})`
+        )
+        return levels
+    }
+
+    _stepDecimals(step) {
+        const s = String(step)
+        if (!s.includes(".")) return 0
+        return s.split(".")[1].length
+    }
+
+    getFixedQty() {
+        return this.quantityPerLevel
+    }
+
+    // ── Bootstrap ────────────────────────────────────────────────────
+
+    async placeInitialOrders() {
+        const currentPrice = await this.client.getPrice(this.pair)
+        this.calculateGridLevels(currentPrice)
+
+        console.log(`📊 Precio actual ${this.pair}: $${currentPrice}`)
+
+        // Idempotencia ante reinicios (clave para auto-arranque al prender la PC):
+        // consultamos el estado real en GRVT antes de comprar o colocar nada,
+        // para no duplicar posición en cada encendido.
+        const [openOrders, position] = await Promise.all([
+            this.client.getOpenOrders(this.pair),
+            this.client.getPosition(this.pair),
+        ])
+        const positionSize = position
+            ? Math.abs(parseFloat(position.size ?? position.balance ?? "0")) || 0
+            : 0
+
+        // Caso 1: ya hay órdenes vivas → el grid está en marcha (la PC se
+        // reinició con órdenes resting). No tocamos nada; el monitor loop
+        // reconcilia los niveles y repone lo que falte.
+        if (openOrders.length > 0) {
+            console.log(
+                `♻️  ${openOrders.length} órdenes abiertas detectadas (posición ${positionSize} ${this.pair}). ` +
+                    `Grid ya en marcha; omito bootstrap y dejo que el monitor reconcilie.`
+            )
+            return
+        }
+
+        let initialInventoryReady = true
+        if (this.config.direction === "long") {
+            if (positionSize > 0) {
+                // Caso 2: hay inventario de un arranque anterior pero sin órdenes
+                // (se cancelaron al apagar). Colocamos el grid SIN recomprar.
+                console.log(
+                    `♻️  Posición existente de ${positionSize} ${this.pair}; omito compra inicial (idempotencia).`
+                )
+            } else {
+                // Caso 3: arranque limpio sin posición → compra inicial normal.
+                try {
+                    await this.executeInitialPurchase(currentPrice)
+                } catch (err) {
+                    const msg = String(err?.message ?? "")
+                    if (msg.includes("Insufficient margin to create order") || msg.includes('"code":2080')) {
+                        initialInventoryReady = false
+                        console.warn("⚠️  Sin margen para compra inicial. Arranco solo con BUYs por debajo del precio.")
+                    } else {
+                        throw err
+                    }
+                }
+            }
+        }
+
+        // Nivel "gap": el más cercano al precio actual se deja sin orden.
+        const gap = this._closestLevel(currentPrice)
+        if (gap) {
+            gap.isFilled = true
+            console.log(`🕳️  Gap level @ $${gap.price} (se deja vacío)`)
+        }
+
+        let placed = 0
+        for (const level of this.levels) {
+            if (level.isFilled) continue
+            if (!this._shouldPlaceOrder(level, currentPrice)) continue
+            if (this.config.direction === "long" && !initialInventoryReady && level.side === "sell") continue
+            try {
+                await this._placeGridOrder(level)
+                placed++
+                await new Promise((r) => setTimeout(r, 200)) // throttle anti rate-limit
+            } catch (err) {
+                console.error(`❌ Error colocando nivel ${level.index} @ $${level.price}: ${err.message}`)
+            }
+        }
+        console.log(`✅ Grid inicial colocado: ${placed} órdenes`)
+    }
+
+    // Compra market inicial para respaldar todos los niveles SELL por encima
+    // del precio (estrategia LONG).
+    async executeInitialPurchase(currentPrice) {
+        const sellLevelsAbove = this.levels.filter((l) => l.price > currentPrice)
+        if (sellLevelsAbove.length === 0) return
+
+        const totalQty = sellLevelsAbove.reduce((sum, l) => sum + l.quantity, 0)
+        const notional = totalQty * currentPrice
+        if (notional < this.spec.minNotional) {
+            console.log(`⚠️  Compra inicial omitida: notional $${notional.toFixed(2)} < min`)
+            return
+        }
+
+        // Precio ligeramente por encima del ask para asegurar fill (IOC).
+        const ticker = await this.client.getTicker(this.pair)
+        const ask = parseFloat(ticker.best_ask_price ?? ticker.best_ask ?? ticker.last_price)
+        const safePrice = Math.floor(ask * 1.001 * 100) / 100
+        const size = (Math.floor(totalQty * 100) / 100).toString()
+
+        console.log(`💰 Compra inicial: BUY ${size} ${this.pair} @ ~$${safePrice} (IOC, notional $${notional.toFixed(2)})`)
+        await this.client.createOrder(
+            {
+                instrument: this.pair,
+                side: "buy",
+                size,
+                price: safePrice.toString(),
+                type: "limit",
+                timeInForce: "ioc",
+            },
+            true
+        )
+        // Damos un momento a que ejecute antes de colocar el grid.
+        await new Promise((r) => setTimeout(r, 2000))
+    }
+
+    _closestLevel(currentPrice) {
+        let best = null
+        let minDist = Infinity
+        for (const level of this.levels) {
+            if (level.isFilled) continue
+            const d = Math.abs(level.price - currentPrice)
+            if (d < minDist) {
+                minDist = d
+                best = level
+            }
+        }
+        return best
+    }
+
+    _shouldPlaceOrder(level, currentPrice) {
+        if (this.config.direction === "long") {
+            return (
+                (level.side === "buy" && level.price < currentPrice) ||
+                (level.side === "sell" && level.price > currentPrice)
+            )
+        }
+        return (
+            (level.side === "sell" && level.price > currentPrice) ||
+            (level.side === "buy" && level.price < currentPrice)
+        )
+    }
+
+    async _placeGridOrder(level) {
+        const notional = level.quantity * level.price
+        if (notional < this.spec.minNotional) {
+            console.log(`⚠️  Skip nivel ${level.index}: notional $${notional.toFixed(2)} < min`)
+            return
+        }
+        this.recentlyPlaced.set(level.index, Date.now())
+        const order = await this.client.createOrder({
+            instrument: this.pair,
+            side: level.side,
+            size: level.quantity.toString(),
+            price: level.price.toString(),
+            type: "limit",
+            timeInForce: "gtc",
+        })
+        level.orderId = order.order_id
+        level.isFilled = false
+        console.log(`📝 ${level.side.toUpperCase()} ${level.quantity} @ $${level.price} (nivel ${level.index})`)
+    }
+
+    // ── Monitor loop ─────────────────────────────────────────────────
+
+    async monitor() {
+        const openOrders = await this.client.getOpenOrders(this.pair)
+        const currentPrice = await this.client.getPrice(this.pair)
+
+        // Mapa precio→orden de GRVT.
+        const grvtPriceSet = new Set()
+        const grvtOrderMap = new Map()
+        for (const order of openOrders) {
+            const leg = order.legs?.[0]
+            if (!leg?.limit_price) continue
+            const price = Math.round(parseFloat(leg.limit_price) * 100) / 100
+            grvtPriceSet.add(price)
+            grvtOrderMap.set(price, {
+                orderId: order.order_id,
+                side: leg.is_buying_asset ? "buy" : "sell",
+            })
+        }
+
+        const gridStep = (this.config.upperPrice - this.config.lowerPrice) / this.config.numGrids
+        const matchTolerance = Math.min(0.05, gridStep / 3)
+
+        // Reconciliar niveles con la realidad de GRVT.
+        const uncovered = []
+        for (const level of this.levels) {
+            const lp = Math.round(level.price * 100) / 100
+            let covered = false
+            for (const gp of grvtPriceSet) {
+                if (Math.abs(gp - lp) < matchTolerance) {
+                    const o = grvtOrderMap.get(gp)
+                    level.orderId = o.orderId
+                    level.side = o.side
+                    level.isFilled = false
+                    grvtPriceSet.delete(gp) // consumir para evitar doble match
+                    covered = true
+                    break
+                }
+            }
+            if (!covered) uncovered.push({ level, dist: Math.abs(lp - currentPrice) })
+        }
+
+        uncovered.sort((a, b) => a.dist - b.dist)
+        console.log(
+            `📊 Monitor: ${openOrders.length} órdenes GRVT, ${uncovered.length} sin cubrir, precio $${currentPrice.toFixed(2)}`
+        )
+
+        // El nivel sin cubrir más cercano es el gap natural.
+        if (uncovered.length > 0) {
+            uncovered[0].level.isFilled = true
+            uncovered[0].level.orderId = null
+        }
+
+        const filledLevels = []
+        if (uncovered.length > 1) {
+            const recentFills = await this.client.getFillHistory(50, this.pair)
+            const now = Date.now()
+
+            for (let i = 1; i < uncovered.length; i++) {
+                const { level } = uncovered[i]
+
+                // ¿Fue un fill reciente?
+                const fill = recentFills.find((f) => {
+                    const fp = parseFloat(f.price)
+                    const ft = parseInt(f.event_time ?? "0") / 1e6
+                    return Math.abs(fp - level.price) < 1.0 && now - ft < 90000
+                })
+
+                if (fill) {
+                    const fillKey = fill.fill_id ?? fill.trade_id ?? `fill-${level.price}-${now}`
+                    if (!this.processedFills.has(fillKey)) {
+                        this.processedFills.add(fillKey)
+                        if (this.processedFills.size > 200) {
+                            ;[...this.processedFills].slice(0, 100).forEach((k) => this.processedFills.delete(k))
+                        }
+                        console.log(`✅ Fill confirmado: ${level.side} @ $${level.price}`)
+                        filledLevels.push(level)
+                    }
+                    continue
+                }
+
+                // Guard de lag: colocada hace poco → no re-colocar todavía.
+                const placedAt = this.recentlyPlaced.get(level.index)
+                if (placedAt && now - placedAt < REPLACE_LAG_MS) continue
+
+                // Re-colocar la orden faltante.
+                const correctSide = level.price < currentPrice ? "buy" : "sell"
+                level.side = correctSide
+                level.quantity = this.getFixedQty()
+                level.isFilled = false
+                console.log(`⚠️  Re-colocando: ${correctSide} @ $${level.price}`)
+                try {
+                    await this._placeGridOrder(level)
+                } catch (err) {
+                    console.error(`❌ Falló re-colocar @ $${level.price}: ${err.message}`)
+                }
+            }
+        }
+
+        await this._killDuplicatesAndOrphans(openOrders)
+        await this._placeCounterOrders(filledLevels, currentPrice)
+    }
+
+    // Mata órdenes duplicadas (mismo precio) y huérfanas (precio sin nivel esperado).
+    async _killDuplicatesAndOrphans(openOrders) {
+        const expectedLevels = this.levels.filter((l) => !l.isFilled)
+        if (openOrders.length <= expectedLevels.length) return
+
+        console.log(`🔴 ${openOrders.length} órdenes (esperadas ≤${expectedLevels.length}) — limpiando`)
+
+        // Paso 1: duplicados exactos por precio.
+        const byPrice = new Map()
+        for (const order of openOrders) {
+            const leg = order.legs?.[0]
+            if (!leg?.limit_price) continue
+            const pk = parseFloat(leg.limit_price).toFixed(2)
+            if (!byPrice.has(pk)) byPrice.set(pk, [])
+            byPrice.get(pk).push(order)
+        }
+
+        const survivors = []
+        for (const [price, orders] of byPrice) {
+            survivors.push(orders[0])
+            for (let i = 1; i < orders.length; i++) {
+                await this.client.cancelOrder(orders[i].order_id, this.pair)
+                console.log(`🗑️  Duplicado eliminado @ $${price}`)
+            }
+        }
+
+        // Paso 2: huérfanas — precio que no coincide con ningún nivel esperado.
+        const expectedPrices = new Set(expectedLevels.map((l) => l.price.toFixed(2)))
+        for (const order of survivors) {
+            const leg = order.legs?.[0]
+            if (!leg?.limit_price) continue
+            const pk = parseFloat(leg.limit_price).toFixed(2)
+            if (!expectedPrices.has(pk)) {
+                await this.client.cancelOrder(order.order_id, this.pair)
+                console.log(`🗑️  Huérfana eliminada @ $${pk}`)
+            }
+        }
+    }
+
+    // Por cada nivel llenado, coloca la contra-orden un nivel arriba/abajo.
+    async _placeCounterOrders(filledLevels, currentPrice) {
+        for (const level of filledLevels) {
+            let counterIndex, counterSide
+            if (level.side === "buy") {
+                counterIndex = level.index + 1
+                counterSide = "sell"
+            } else {
+                counterIndex = level.index - 1
+                counterSide = "buy"
+            }
+
+            const counter = this.levels.find((l) => l.index === counterIndex)
+            if (!counter) {
+                console.log(`⚠️  Sin nivel contrario para index ${counterIndex}, omitido`)
+                continue
+            }
+
+            // Si el nivel destino ya tiene orden activa, no duplicar.
+            if (counter.orderId && !counter.isFilled) {
+                level.isFilled = true
+                level.orderId = null
+                continue
+            }
+
+            const qty = this.getFixedQty()
+            console.log(
+                `🔄 Round-trip: ${level.side} lleno @ $${level.price} → ${counterSide} ${qty} @ $${counter.price}`
+            )
+            try {
+                counter.side = counterSide
+                counter.quantity = qty
+                counter.isFilled = false
+                await this._placeGridOrder(counter)
+                level.isFilled = true
+                level.orderId = null
+            } catch (err) {
+                console.error(`❌ Falló contra-orden @ $${counter.price}: ${err.message}`)
+            }
+        }
+    }
+
+    // ── Ciclo de vida ────────────────────────────────────────────────
+
+    start(intervalMs = 5000) {
+        this.running = true
+        this.interval = setInterval(async () => {
+            if (!this.running) return
+            try {
+                await this.monitor()
+            } catch (err) {
+                console.error(`❌ Error en monitor: ${err.message}`)
+            }
+        }, intervalMs)
+        console.log(`🚀 Monitor iniciado (cada ${intervalMs / 1000}s)`)
+    }
+
+    async stop() {
+        this.running = false
+        if (this.interval) clearInterval(this.interval)
+        console.log("🛑 Deteniendo bot — cancelando todas las órdenes...")
+        const cancelled = await this.client.cancelAllOrders(this.pair)
+        console.log(`✅ ${cancelled} órdenes canceladas. Posición (si hay) NO se cierra.`)
+    }
+}
+</file>
+
+<file path="package.json">
+{
+  "name": "grid-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Bot de trading con la estrategia GRID sobre el exchange GRVT",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@metamask/eth-sig-util": "^7.0.3",
+    "dotenv": "^17.4.2"
+  }
+}
+</file>
+
+</files>
